@@ -1,0 +1,14 @@
+id: m855
+name: 5.56x45mm NATO M855
+mass_g: 12.31  # полная масса патрона
+projectile:
+  mass_g: 4.0
+  diameter_mm: 5.7
+  length_mm: 23.0
+  center_of_mass:
+    x_mm: 0.0
+    y_mm: 0.0
+    z_mm: 0.0
+model: G7  # G1/G2/G7/Rod/Sphere
+velocity:
+  v0_mps: 910.0          # начальная скорость

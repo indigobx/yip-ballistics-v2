@@ -1,0 +1,6 @@
+id: air
+name: Standard air (placeholder)
+density_kg_m3: 1.2041
+temperature_C: 20.0
+speed_of_sound_m_s: 343.26
+model: gas  # тут название модели среды, которая будет использоваться для газа/жидкости/вязких веществ/твердых тел

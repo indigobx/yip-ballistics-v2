@@ -1,0 +1,58 @@
+schema: ballistic.sim.scenario.v1
+id: m4a1_m855_gel_plate_demo
+description: M4A1 + M855, ветер, цель из слоёв (броня/воздух/гель/плита)
+
+weapon:
+  id: m4a1
+ammo:
+  id: m855
+
+environment:
+  medium: air
+  overrides:
+    air:
+      temperature_c: 30.0
+  wind:
+    direction_deg: 0.0
+    speed_mps: 4.5
+  ground:
+    medium: mud
+
+shot:
+  # Геометрия/настройки выстрела
+  elevation_angle_deg: 2.0        # угол возвышения ствола/оси канала
+  sight_offset_angle_deg: -2.0     # установка прицела/линии визирования относительно оси
+limits:
+  max_distance_m: 1000.0
+  max_drop_m: 100.0
+  max_height_m: 100.0
+  max_drift_m: 100.0
+  min_energy_j: 10.0
+
+target:
+  - name: target_1
+    position_m: 30.0
+    layers:
+    - name: cardboard
+      medium: cardboard
+      thickness_mm: 0.2
+  - name: target_2
+    position_m: 100.0
+    layers:
+    - name: armor
+      medium: armor_class_2
+      thickness_mm: 2.0
+
+    - medium: air
+      thickness_mm: 30.0
+
+    - name: gel
+      medium: ballistic_gel
+      thickness_mm: 400.0
+
+    - medium: air
+      thickness_mm: 200.0
+
+    - name: plate
+      medium: steel_rha
+      thickness_mm: 20.0
