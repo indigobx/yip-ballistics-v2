@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, Optional
 
 import numpy as np
+
+DragModel = Literal["G1", "G2", "G7", "Rod", "Sphere"]
 
 
 def _req(d: dict[str, Any], key: str) -> Any:
@@ -26,9 +28,32 @@ def _as_float(x: Any, *, name: str) -> float:
 def _as_str(x: Any, *, name: str) -> str:
   if not isinstance(x, str):
     raise TypeError(f"Field {name} must be str, got: {type(x).__name__}")
-  if not x.strip():
+  s = x.strip()
+  if not s:
     raise ValueError(f"Field {name} must be non-empty")
-  return x.strip()
+  return s
+
+
+def _as_drag_model(x: Any, *, name: str) -> DragModel:
+  s = _as_str(x, name=name)
+  allowed = ("G1", "G2", "G7", "Rod", "Sphere")
+  if s not in allowed:
+    raise ValueError(f"Field {name} must be one of {allowed}, got: {s}")
+  return s  # type: ignore[return-value]
+
+
+@dataclass(slots=True, frozen=True)
+class ProjectileDrag:
+  model: DragModel
+  bc: float
+
+  @staticmethod
+  def from_dict(d: dict[str, Any]) -> "ProjectileDrag":
+    model = _as_drag_model(_req(d, 'model'), name='projectile.drag.model')
+    bc = _as_float(_req(d, 'bc'), name='projectile.drag.bc')
+    if bc <= 0.0:
+      raise ValueError(f"projectile.drag.bc must be > 0, got: {bc}")
+    return ProjectileDrag(model=model, bc=bc)
 
 
 @dataclass(slots=True, frozen=True)
@@ -37,6 +62,7 @@ class ProjectileSpec:
   diameter_m: float
   length_m: float
   com_m: np.ndarray = field(repr=False)
+  drag: Optional[ProjectileDrag] = None
 
   @staticmethod
   def from_dict(d: dict[str, Any]) -> "ProjectileSpec":
@@ -48,6 +74,9 @@ class ProjectileSpec:
     x_mm = _as_float(com.get('x_mm', 0.0), name='projectile.center_of_mass.x_mm')
     y_mm = _as_float(com.get('y_mm', 0.0), name='projectile.center_of_mass.y_mm')
     z_mm = _as_float(com.get('z_mm', 0.0), name='projectile.center_of_mass.z_mm')
+
+    drag_in = d.get('drag', None)
+    drag = ProjectileDrag.from_dict(drag_in) if isinstance(drag_in, dict) else None
 
     mass_kg = mass_g / 1000.0
     diameter_m = diameter_mm / 1000.0
@@ -66,6 +95,7 @@ class ProjectileSpec:
       diameter_m=diameter_m,
       length_m=length_m,
       com_m=com_m,
+      drag=drag,
     )
 
   @property
@@ -79,7 +109,6 @@ class Ammo:
   id: str
   name: str
   mass_kg: float
-  model: str
   v0_mps: float
   projectile: ProjectileSpec
 
@@ -88,7 +117,6 @@ class Ammo:
     ammo_id = _as_str(_req(d, 'id'), name='ammo.id')
     name = _as_str(_req(d, 'name'), name='ammo.name')
     mass_g = _as_float(_req(d, 'mass_g'), name='ammo.mass_g')
-    model = _as_str(_req(d, 'model'), name='ammo.model')
 
     vel = d.get('velocity', {}) or {}
     v0_mps = _as_float(_req(vel, 'v0_mps'), name='ammo.velocity.v0_mps')
@@ -105,7 +133,6 @@ class Ammo:
       id=ammo_id,
       name=name,
       mass_kg=mass_kg,
-      model=model,
       v0_mps=v0_mps,
       projectile=proj,
     )

@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from func.classes import Ammo, Medium, ProjectileState, Weapon
+from func.drag import DragConfig, drag_accel
 from func.scenario import Scenario
 
 
@@ -19,6 +20,7 @@ class SolverConfig:
   dt_s: float = 1.0 / 240.0
   t_max_s: float = 5.0
   integrator: str = 'rk4'
+  drag_enabled: bool = True
 
 
 @dataclass(slots=True, frozen=True)
@@ -48,42 +50,71 @@ class BallisticContext:
   medium: Medium
   gravity_mps2: float
   wind_vel_mps: Vec3
+  drag_cfg: DragConfig
 
 
 def _unit_vec_from_elevation_deg(elev_deg: float) -> Vec3:
   # Оси:
-  # x: дальность вперёд
-  # y: вправо (дрейф)
-  # z: вверх
+  # +X: вперёд (дальность)
+  # +Y: вправо (дрейф)
+  # +Z: вверх (высота)
   a = np.deg2rad(float(elev_deg))
   return np.array([np.cos(a), 0.0, np.sin(a)], dtype=np.float64)
 
 
-def _derivatives_gravity_only(state: ProjectileState, ctx: BallisticContext) -> tuple[Vec3, Vec3]:
+def _derivatives_external(state: ProjectileState, ctx: BallisticContext) -> tuple[Vec3, Vec3]:
   # dpos/dt = vel
-  # dvel/dt = accel
   dpos = state.vel_mps
-  dvel = np.array([0.0, 0.0, -ctx.gravity_mps2], dtype=np.float64)
+
+  # Внешние силы:
+  # 1) гравитация
+  a_grav = np.array([0.0, 0.0, -ctx.gravity_mps2], dtype=np.float64)
+
+  # 2) сопротивление воздуха (против скорости относительно воздуха)
+  v_rel = state.vel_mps - ctx.wind_vel_mps
+  a_drag_xyz = drag_accel(
+    v_xyz_mps=(float(v_rel[0]), float(v_rel[1]), float(v_rel[2])),
+    projectile=ctx.ammo.projectile,
+    rho_kg_m3=ctx.medium.density_kg_m3,
+    cfg=ctx.drag_cfg,
+  )
+  a_drag = np.array(a_drag_xyz, dtype=np.float64)
+
+  dvel = a_grav + a_drag
   return dpos, dvel
 
 
-def _rk4_step(state: ProjectileState,
-              ctx: BallisticContext,
-              dt: float,
-              deriv_fn: Callable[[ProjectileState, BallisticContext], tuple[Vec3, Vec3]]) -> ProjectileState:
+def _rk4_step(
+  state: ProjectileState,
+  ctx: BallisticContext,
+  dt: float,
+  deriv_fn: Callable[[ProjectileState, BallisticContext], tuple[Vec3, Vec3]],
+) -> ProjectileState:
   t0 = state.t_s
   p0 = state.pos_m
   v0 = state.vel_mps
 
   dp1, dv1 = deriv_fn(state, ctx)
 
-  s2 = ProjectileState(t_s=t0 + 0.5 * dt, pos_m=p0 + 0.5 * dt * dp1, vel_mps=v0 + 0.5 * dt * dv1)
+  s2 = ProjectileState(
+    t_s=t0 + 0.5 * dt,
+    pos_m=p0 + 0.5 * dt * dp1,
+    vel_mps=v0 + 0.5 * dt * dv1,
+  )
   dp2, dv2 = deriv_fn(s2, ctx)
 
-  s3 = ProjectileState(t_s=t0 + 0.5 * dt, pos_m=p0 + 0.5 * dt * dp2, vel_mps=v0 + 0.5 * dt * dv2)
+  s3 = ProjectileState(
+    t_s=t0 + 0.5 * dt,
+    pos_m=p0 + 0.5 * dt * dp2,
+    vel_mps=v0 + 0.5 * dt * dv2,
+  )
   dp3, dv3 = deriv_fn(s3, ctx)
 
-  s4 = ProjectileState(t_s=t0 + dt, pos_m=p0 + dt * dp3, vel_mps=v0 + dt * dv3)
+  s4 = ProjectileState(
+    t_s=t0 + dt,
+    pos_m=p0 + dt * dp3,
+    vel_mps=v0 + dt * dv3,
+  )
   dp4, dv4 = deriv_fn(s4, ctx)
 
   p1 = p0 + (dt / 6.0) * (dp1 + 2.0 * dp2 + 2.0 * dp3 + dp4)
@@ -93,7 +124,6 @@ def _rk4_step(state: ProjectileState,
 
 
 def _stop_reason(state: ProjectileState, scenario: Scenario, ctx: BallisticContext) -> Optional[str]:
-  # Дальность считаем по x. (позже можно заменить на sqrt(x^2+y^2))
   x = float(state.pos_m[0])
   y = float(state.pos_m[1])
   z = float(state.pos_m[2])
@@ -104,7 +134,8 @@ def _stop_reason(state: ProjectileState, scenario: Scenario, ctx: BallisticConte
   if x >= scenario.limits.max_distance_m:
     return 'max_distance'
 
-  if -z >= scenario.limits.max_drop_m:
+  drop_m = -z  # z0 = 0, вниз = положительный drop
+  if drop_m >= scenario.limits.max_drop_m:
     return 'max_drop'
 
   if z >= scenario.limits.max_height_m:
@@ -119,7 +150,6 @@ def _stop_reason(state: ProjectileState, scenario: Scenario, ctx: BallisticConte
     return 'min_energy'
 
   if state.t_s >= scenario.limits.max_distance_m / max(ctx.ammo.v0_mps, 1e-9) + 10.0:
-    # запасной “анти-дурак” лимит по времени, если max_distance гигантский
     return 'time_guard'
 
   return None
@@ -139,12 +169,14 @@ def solve_scenario_external_ballistics_only(
     raise ValueError(f"dt_s must be > 0, got: {dt}")
 
   wind = scenario.environment.wind
-  # направление: 0 deg = вдоль +x (вперёд), 90 = +y (вправо)
+  # направление: 0 deg = вдоль +x (вперёд), 90 deg = +y (вправо)
   wd = np.deg2rad(float(wind.direction_deg))
   wind_vel = np.array(
     [np.cos(wd) * wind.speed_mps, np.sin(wd) * wind.speed_mps, 0.0],
     dtype=np.float64,
   )
+
+  drag_cfg = DragConfig(enabled=bool(config.drag_enabled))
 
   ctx = BallisticContext(
     ammo=ammo,
@@ -152,10 +184,9 @@ def solve_scenario_external_ballistics_only(
     medium=medium,
     gravity_mps2=float(gravity_mps2),
     wind_vel_mps=wind_vel,
+    drag_cfg=drag_cfg,
   )
 
-  # Начальная скорость: пока только elevation. Sight offset позже будет влиять на прицеливание/zeroing,
-  # но физически ствол всё равно стреляет по elevation.
   dir_vec = _unit_vec_from_elevation_deg(scenario.shot.elevation_angle_deg)
   v0 = ammo.v0_mps * dir_vec
 
@@ -166,25 +197,30 @@ def solve_scenario_external_ballistics_only(
   )
 
   rows: list[dict[str, Any]] = []
-  stop = None
-  n = 0
-
-  deriv_fn = _derivatives_gravity_only
-
-  # Важный крючок под будущее:
-  # тут позже появится "event pipeline": проверка пересечения целей/слоёв/преград на отрезке шага.
   events_rows: list[dict[str, Any]] = []
 
+  stop = None
+  n = 0
+  deriv_fn = _derivatives_external
+
   while state.t_s <= config.t_max_s:
+    v_rel = state.vel_mps - ctx.wind_vel_mps
+    rel_speed = float(np.linalg.norm(v_rel))
+    mach = rel_speed / max(ctx.medium.speed_of_sound_m_s, 1e-9)
+    z = float(state.pos_m[2])
+
     rows.append({
       't_s': state.t_s,
       'x_m': float(state.pos_m[0]),
       'y_m': float(state.pos_m[1]),
-      'z_m': float(state.pos_m[2]),
+      'z_m': z,
+      'drop_m': -z,
       'vx_mps': float(state.vel_mps[0]),
       'vy_mps': float(state.vel_mps[1]),
       'vz_mps': float(state.vel_mps[2]),
       'speed_mps': state.speed_mps,
+      'rel_speed_mps': rel_speed,
+      'mach': mach,
       'energy_j': 0.5 * ammo.projectile.mass_kg * state.speed_mps * state.speed_mps,
     })
 

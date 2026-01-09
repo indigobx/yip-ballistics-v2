@@ -20,8 +20,8 @@ environment:
 
 shot:
   # Геометрия/настройки выстрела
-  elevation_angle_deg: 2.0        # угол возвышения ствола/оси канала
-  sight_offset_angle_deg: -2.0     # установка прицела/линии визирования относительно оси
+  elevation_angle_deg: 0.0        # угол возвышения ствола/оси канала
+  sight_offset_angle_deg: -0.0     # установка прицела/линии визирования относительно оси
 limits:
   max_distance_m: 1000.0
   max_drop_m: 100.0
