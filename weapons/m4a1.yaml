@@ -4,5 +4,7 @@ mass_kg: 2.92
 ammo_capacity: 30
 barrel:
   length_mm: 368.0
-  twist_rate: 7.0  # inches per one full rotation
+  twist:
+    rate: 7.0  # inches per one full rotation
+    clockwise: true
 

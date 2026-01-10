@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Sequence
 
 import numpy as np
 
-DragModel = Literal["G1", "G2", "G7", "Rod", "Sphere"]
+
+DragKind = Literal['standard', 'primitive', 'cd_const', 'cd_table']
+DragModel = Literal['G1', 'G2', 'G7', 'Rod', 'Sphere']
 
 
 def _req(d: dict[str, Any], key: str) -> Any:
@@ -42,18 +44,62 @@ def _as_drag_model(x: Any, *, name: str) -> DragModel:
   return s  # type: ignore[return-value]
 
 
+def _as_bool(x: Any, *, name: str) -> bool:
+  if isinstance(x, bool):
+    return x
+  raise TypeError(f"Field {name} must be bool, got: {type(x).__name__}")
+
+
 @dataclass(slots=True, frozen=True)
 class ProjectileDrag:
+  kind: DragKind
   model: DragModel
-  bc: float
+  bc: Optional[float] = None
+  cd: Optional[float] = None
+  cd_vs_mach: Optional[Sequence[Sequence[float]]] = None
 
   @staticmethod
   def from_dict(d: dict[str, Any]) -> "ProjectileDrag":
-    model = _as_drag_model(_req(d, 'model'), name='projectile.drag.model')
-    bc = _as_float(_req(d, 'bc'), name='projectile.drag.bc')
-    if bc <= 0.0:
-      raise ValueError(f"projectile.drag.bc must be > 0, got: {bc}")
-    return ProjectileDrag(model=model, bc=bc)
+    kind = _as_str(_req(d, 'kind'), name='projectile.drag.kind')
+    model = _as_str(_req(d, 'model'), name='projectile.drag.model')
+
+    if kind not in ('standard', 'primitive', 'cd_const', 'cd_table'):
+      raise ValueError(f"Unsupported drag.kind: {kind}")
+
+    bc = d.get('bc')
+    cd = d.get('cd')
+    table = d.get('cd_vs_mach')
+
+    if kind == 'standard':
+      if bc is None:
+        raise ValueError('projectile.drag.bc is required for kind=standard')
+      bc_f = _as_float(bc, name='projectile.drag.bc')
+      if bc_f <= 0.0:
+        raise ValueError('projectile.drag.bc must be > 0')
+      return ProjectileDrag(kind=kind, model=model, bc=bc_f)
+
+    if kind == 'primitive':
+      return ProjectileDrag(kind=kind, model=model)
+
+    if kind == 'cd_const':
+      if cd is None:
+        raise ValueError('projectile.drag.cd is required for kind=cd_const')
+      cd_f = _as_float(cd, name='projectile.drag.cd')
+      if cd_f <= 0.0:
+        raise ValueError('projectile.drag.cd must be > 0')
+      return ProjectileDrag(kind=kind, model=model, cd=cd_f)
+
+    if kind == 'cd_table':
+      if not isinstance(table, (list, tuple)) or len(table) < 2:
+        raise ValueError('projectile.drag.cd_vs_mach must be list[[mach, cd], ...]')
+      for row in table:
+        if not isinstance(row, (list, tuple)) or len(row) != 2:
+          raise ValueError('Each cd_vs_mach row must be [mach, cd]')
+        _as_float(row[0], name='projectile.drag.cd_vs_mach.mach')
+        _as_float(row[1], name='projectile.drag.cd_vs_mach.cd')
+      return ProjectileDrag(kind=kind, model=model, cd_vs_mach=table)
+
+    raise AssertionError('unreachable')
 
 
 @dataclass(slots=True, frozen=True)
@@ -142,19 +188,28 @@ class Ammo:
 class BarrelSpec:
   length_m: float
   twist_rate_in_per_turn: float
+  twist_clockwise: bool
 
   @staticmethod
   def from_dict(d: dict[str, Any]) -> "BarrelSpec":
     length_mm = _as_float(_req(d, 'length_mm'), name='weapon.barrel.length_mm')
-    twist_rate = _as_float(_req(d, 'twist_rate'), name='weapon.barrel.twist_rate')
+    twist = _req(d, 'twist')
+    if not isinstance(twist, dict):
+      raise TypeError(f"Field weapon.barrel.twist must be mapping, got: {type(twist).__name__}")
+    twist_rate = _as_float(_req(twist, 'rate'), name='weapon.barrel.twist.rate')
+    twist_clockwise = _as_bool(_req(twist, 'clockwise'), name='weapon.barrel.twist.clockwise')
 
     length_m = length_mm / 1000.0
     if length_m <= 0.0:
       raise ValueError(f"barrel.length_m must be > 0, got: {length_m}")
     if twist_rate <= 0.0:
-      raise ValueError(f"barrel.twist_rate must be > 0, got: {twist_rate}")
+      raise ValueError(f"barrel.twist.rate must be > 0, got: {twist_rate}")
 
-    return BarrelSpec(length_m=length_m, twist_rate_in_per_turn=twist_rate)
+    return BarrelSpec(
+      length_m=length_m,
+      twist_rate_in_per_turn=twist_rate,
+      twist_clockwise=twist_clockwise,
+    )
 
   @property
   def twist_m_per_turn(self) -> float:
@@ -234,12 +289,35 @@ class ProjectileState:
   t_s: float
   pos_m: np.ndarray = field(repr=False)
   vel_mps: np.ndarray = field(repr=False)
+  axis_unit: Optional[np.ndarray] = field(default=None, repr=False)
+  roll_rad: float = 0.0
+  angvel_radps: Optional[np.ndarray] = field(default=None, repr=False)
 
   def __post_init__(self) -> None:
     self.t_s = float(self.t_s)
 
     self.pos_m = np.asarray(self.pos_m, dtype=np.float64).reshape(3)
     self.vel_mps = np.asarray(self.vel_mps, dtype=np.float64).reshape(3)
+    self.roll_rad = float(self.roll_rad)
+
+    if self.axis_unit is None:
+      speed = float(np.linalg.norm(self.vel_mps))
+      if speed > 0.0:
+        self.axis_unit = self.vel_mps / speed
+      else:
+        self.axis_unit = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    else:
+      self.axis_unit = np.asarray(self.axis_unit, dtype=np.float64).reshape(3)
+      norm = float(np.linalg.norm(self.axis_unit))
+      if norm > 0.0:
+        self.axis_unit = self.axis_unit / norm
+      else:
+        self.axis_unit = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+
+    if self.angvel_radps is None:
+      self.angvel_radps = np.zeros(3, dtype=np.float64)
+    else:
+      self.angvel_radps = np.asarray(self.angvel_radps, dtype=np.float64).reshape(3)
 
     if not np.isfinite(self.t_s):
       raise ValueError(f"state.t_s must be finite, got: {self.t_s}")
@@ -247,6 +325,12 @@ class ProjectileState:
       raise ValueError(f"state.pos_m must be finite, got: {self.pos_m}")
     if not np.all(np.isfinite(self.vel_mps)):
       raise ValueError(f"state.vel_mps must be finite, got: {self.vel_mps}")
+    if not np.all(np.isfinite(self.axis_unit)):
+      raise ValueError(f"state.axis_unit must be finite, got: {self.axis_unit}")
+    if not np.isfinite(self.roll_rad):
+      raise ValueError(f"state.roll_rad must be finite, got: {self.roll_rad}")
+    if not np.all(np.isfinite(self.angvel_radps)):
+      raise ValueError(f"state.angvel_radps must be finite, got: {self.angvel_radps}")
 
   @property
   def speed_mps(self) -> float:
@@ -257,4 +341,7 @@ class ProjectileState:
       t_s=float(self.t_s),
       pos_m=self.pos_m.copy(),
       vel_mps=self.vel_mps.copy(),
+      axis_unit=self.axis_unit.copy(),
+      roll_rad=float(self.roll_rad),
+      angvel_radps=self.angvel_radps.copy(),
     )

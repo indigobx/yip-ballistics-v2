@@ -10,7 +10,8 @@ projectile:
     y_mm: 0.0
     z_mm: 0.0
   drag:
-    model: G7  # G1/G2/G7/Rod/Sphere
-    bc: 0.171
+    kind: standard
+    model: G7  # G1/G2/G7 для стандартных эталонных кривых
+    bc: 0.151
 velocity:
-  v0_mps: 910.0          # начальная скорость
+  v0_mps: 910.0  # начальная скорость

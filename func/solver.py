@@ -21,6 +21,10 @@ class SolverConfig:
   t_max_s: float = 5.0
   integrator: str = 'rk4'
   drag_enabled: bool = True
+  lift_enabled: bool = True
+  lift_cl_alpha: float = 2.0
+  magnus_enabled: bool = True
+  magnus_cl_scale: float = 0.5
 
 
 @dataclass(slots=True, frozen=True)
@@ -51,6 +55,10 @@ class BallisticContext:
   gravity_mps2: float
   wind_vel_mps: Vec3
   drag_cfg: DragConfig
+  lift_enabled: bool
+  lift_cl_alpha: float
+  magnus_enabled: bool
+  magnus_cl_scale: float
 
 
 def _unit_vec_from_elevation_deg(elev_deg: float) -> Vec3:
@@ -62,7 +70,10 @@ def _unit_vec_from_elevation_deg(elev_deg: float) -> Vec3:
   return np.array([np.cos(a), 0.0, np.sin(a)], dtype=np.float64)
 
 
-def _derivatives_external(state: ProjectileState, ctx: BallisticContext) -> tuple[Vec3, Vec3]:
+def _derivatives_external(
+  state: ProjectileState,
+  ctx: BallisticContext,
+) -> tuple[Vec3, Vec3, Vec3, float, Vec3]:
   # dpos/dt = vel
   dpos = state.vel_mps
 
@@ -77,50 +88,127 @@ def _derivatives_external(state: ProjectileState, ctx: BallisticContext) -> tupl
     projectile=ctx.ammo.projectile,
     rho_kg_m3=ctx.medium.density_kg_m3,
     cfg=ctx.drag_cfg,
+    speed_of_sound_m_s=ctx.medium.speed_of_sound_m_s,
   )
   a_drag = np.array(a_drag_xyz, dtype=np.float64)
 
-  dvel = a_grav + a_drag
-  return dpos, dvel
+  a_lift = np.zeros(3, dtype=np.float64)
+  a_magnus = np.zeros(3, dtype=np.float64)
+
+  rel_speed = float(np.linalg.norm(v_rel))
+  if rel_speed > 0.0:
+    v_rel_hat = v_rel / rel_speed
+    axis = state.axis_unit
+    axis_dot = float(np.dot(axis, v_rel_hat))
+    axis_perp = axis - axis_dot * v_rel_hat
+    axis_perp_norm = float(np.linalg.norm(axis_perp))
+
+    area_m2 = ctx.ammo.projectile.area_m2
+    mass_kg = ctx.ammo.projectile.mass_kg
+
+    if ctx.lift_enabled and axis_perp_norm > 0.0:
+      aoa = float(np.arctan2(axis_perp_norm, max(abs(axis_dot), 1e-9)))
+      cl = ctx.lift_cl_alpha * aoa
+      lift_dir = axis_perp / axis_perp_norm
+      a_lift = 0.5 * ctx.medium.density_kg_m3 * cl * area_m2 * (rel_speed ** 2) / max(mass_kg, 1e-9) * lift_dir
+
+    if ctx.magnus_enabled:
+      omega = state.angvel_radps
+      omega_mag = float(np.linalg.norm(omega))
+      if omega_mag > 0.0:
+        magnus_dir = np.cross(omega, v_rel)
+        magnus_norm = float(np.linalg.norm(magnus_dir))
+        if magnus_norm > 0.0:
+          magnus_dir = magnus_dir / magnus_norm
+          radius = 0.5 * ctx.ammo.projectile.diameter_m
+          spin_ratio = omega_mag * radius / max(rel_speed, 1e-9)
+          cl_magnus = ctx.magnus_cl_scale * spin_ratio
+          a_magnus = 0.5 * ctx.medium.density_kg_m3 * cl_magnus * area_m2 * (rel_speed ** 2) / max(mass_kg, 1e-9) * magnus_dir
+
+  dvel = a_grav + a_drag + a_lift + a_magnus
+
+  axis = state.axis_unit
+  omega = state.angvel_radps
+  daxis = np.cross(omega, axis)
+  droll = float(np.dot(omega, axis))
+  dangvel = np.zeros(3, dtype=np.float64)
+
+  return dpos, dvel, daxis, droll, dangvel
 
 
 def _rk4_step(
   state: ProjectileState,
   ctx: BallisticContext,
   dt: float,
-  deriv_fn: Callable[[ProjectileState, BallisticContext], tuple[Vec3, Vec3]],
+  deriv_fn: Callable[[ProjectileState, BallisticContext], tuple[Vec3, Vec3, Vec3, float, Vec3]],
 ) -> ProjectileState:
   t0 = state.t_s
   p0 = state.pos_m
   v0 = state.vel_mps
+  a0 = state.axis_unit
+  r0 = state.roll_rad
+  w0 = state.angvel_radps
 
-  dp1, dv1 = deriv_fn(state, ctx)
+  dp1, dv1, da1, dr1, dw1 = deriv_fn(state, ctx)
 
   s2 = ProjectileState(
     t_s=t0 + 0.5 * dt,
     pos_m=p0 + 0.5 * dt * dp1,
     vel_mps=v0 + 0.5 * dt * dv1,
+    axis_unit=a0 + 0.5 * dt * da1,
+    roll_rad=r0 + 0.5 * dt * dr1,
+    angvel_radps=w0 + 0.5 * dt * dw1,
   )
-  dp2, dv2 = deriv_fn(s2, ctx)
+  dp2, dv2, da2, dr2, dw2 = deriv_fn(s2, ctx)
 
   s3 = ProjectileState(
     t_s=t0 + 0.5 * dt,
     pos_m=p0 + 0.5 * dt * dp2,
     vel_mps=v0 + 0.5 * dt * dv2,
+    axis_unit=a0 + 0.5 * dt * da2,
+    roll_rad=r0 + 0.5 * dt * dr2,
+    angvel_radps=w0 + 0.5 * dt * dw2,
   )
-  dp3, dv3 = deriv_fn(s3, ctx)
+  dp3, dv3, da3, dr3, dw3 = deriv_fn(s3, ctx)
 
   s4 = ProjectileState(
     t_s=t0 + dt,
     pos_m=p0 + dt * dp3,
     vel_mps=v0 + dt * dv3,
+    axis_unit=a0 + dt * da3,
+    roll_rad=r0 + dt * dr3,
+    angvel_radps=w0 + dt * dw3,
   )
-  dp4, dv4 = deriv_fn(s4, ctx)
+  dp4, dv4, da4, dr4, dw4 = deriv_fn(s4, ctx)
 
   p1 = p0 + (dt / 6.0) * (dp1 + 2.0 * dp2 + 2.0 * dp3 + dp4)
   v1 = v0 + (dt / 6.0) * (dv1 + 2.0 * dv2 + 2.0 * dv3 + dv4)
+  a1 = a0 + (dt / 6.0) * (da1 + 2.0 * da2 + 2.0 * da3 + da4)
+  r1 = r0 + (dt / 6.0) * (dr1 + 2.0 * dr2 + 2.0 * dr3 + dr4)
+  w1 = w0 + (dt / 6.0) * (dw1 + 2.0 * dw2 + 2.0 * dw3 + dw4)
 
-  return ProjectileState(t_s=t0 + dt, pos_m=p1, vel_mps=v1)
+  a_norm = float(np.linalg.norm(a1))
+  if a_norm > 0.0:
+    a1 = a1 / a_norm
+  else:
+    a1 = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+
+  return ProjectileState(
+    t_s=t0 + dt,
+    pos_m=p1,
+    vel_mps=v1,
+    axis_unit=a1,
+    roll_rad=r1,
+    angvel_radps=w1,
+  )
+
+
+def _angles_from_axis(axis: Vec3, roll_rad: float) -> tuple[float, float, float]:
+  xy = float(np.hypot(axis[0], axis[1]))
+  yaw = float(np.arctan2(axis[1], axis[0]))
+  pitch = float(np.arctan2(axis[2], max(xy, 1e-9)))
+  roll = float(roll_rad)
+  return roll, pitch, yaw
 
 
 def _stop_reason(state: ProjectileState, scenario: Scenario, ctx: BallisticContext) -> Optional[str]:
@@ -185,15 +273,28 @@ def solve_scenario_external_ballistics_only(
     gravity_mps2=float(gravity_mps2),
     wind_vel_mps=wind_vel,
     drag_cfg=drag_cfg,
+    lift_enabled=bool(config.lift_enabled),
+    lift_cl_alpha=float(config.lift_cl_alpha),
+    magnus_enabled=bool(config.magnus_enabled),
+    magnus_cl_scale=float(config.magnus_cl_scale),
   )
 
   dir_vec = _unit_vec_from_elevation_deg(scenario.shot.elevation_angle_deg)
   v0 = ammo.v0_mps * dir_vec
 
+  twist_m_per_turn = weapon.barrel.twist_m_per_turn
+  spin_rps = ammo.v0_mps / max(twist_m_per_turn, 1e-9)
+  spin_radps = 2.0 * np.pi * spin_rps
+  spin_sign = -1.0 if weapon.barrel.twist_clockwise else 1.0
+  angvel = dir_vec * (spin_radps * spin_sign)
+
   state = ProjectileState(
     t_s=0.0,
     pos_m=np.array([0.0, 0.0, 0.0], dtype=np.float64),
     vel_mps=v0,
+    axis_unit=dir_vec,
+    roll_rad=0.0,
+    angvel_radps=angvel,
   )
 
   rows: list[dict[str, Any]] = []
@@ -208,6 +309,13 @@ def solve_scenario_external_ballistics_only(
     rel_speed = float(np.linalg.norm(v_rel))
     mach = rel_speed / max(ctx.medium.speed_of_sound_m_s, 1e-9)
     z = float(state.pos_m[2])
+    if rel_speed > 0.0:
+      v_rel_hat = v_rel / rel_speed
+      aoa = float(np.arccos(np.clip(float(np.dot(state.axis_unit, v_rel_hat)), -1.0, 1.0)))
+    else:
+      aoa = 0.0
+
+    angle_x, angle_y, angle_z = _angles_from_axis(state.axis_unit, state.roll_rad)
 
     rows.append({
       't_s': state.t_s,
@@ -222,6 +330,13 @@ def solve_scenario_external_ballistics_only(
       'rel_speed_mps': rel_speed,
       'mach': mach,
       'energy_j': 0.5 * ammo.projectile.mass_kg * state.speed_mps * state.speed_mps,
+      'angle_x': angle_x,
+      'angle_y': angle_y,
+      'angle_z': angle_z,
+      'angvel_x': float(state.angvel_radps[0]),
+      'angvel_y': float(state.angvel_radps[1]),
+      'angvel_z': float(state.angvel_radps[2]),
+      'aoa': aoa,
     })
 
     stop = _stop_reason(state, scenario, ctx)

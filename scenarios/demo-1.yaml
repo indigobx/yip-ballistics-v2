@@ -24,7 +24,7 @@ shot:
   sight_offset_angle_deg: -0.0     # установка прицела/линии визирования относительно оси
 limits:
   max_distance_m: 1000.0
-  max_drop_m: 100.0
+  max_drop_m: 30.0
   max_height_m: 100.0
   max_drift_m: 100.0
   min_energy_j: 10.0
