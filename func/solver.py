@@ -7,7 +7,7 @@ from typing import Any, Callable, Optional
 import numpy as np
 import pandas as pd
 
-from func.classes import Ammo, Medium, ProjectileState, Weapon
+from func.classes import Ammo, Medium, ProjectileSixDof, ProjectileState, Weapon
 from func.drag import DragConfig, drag_accel
 from func.scenario import Scenario
 
@@ -25,6 +25,8 @@ class SolverConfig:
   lift_cl_alpha: float = 2.0
   magnus_enabled: bool = True
   magnus_cl_scale: float = 0.5
+  six_dof_force_scale: float = 1.0
+  six_dof_aoa_limit_rad: float = 0.02
 
 
 @dataclass(slots=True, frozen=True)
@@ -59,6 +61,9 @@ class BallisticContext:
   lift_cl_alpha: float
   magnus_enabled: bool
   magnus_cl_scale: float
+  six_dof: Optional[ProjectileSixDof] = None
+  six_dof_force_scale: float = 1.0
+  six_dof_aoa_limit_rad: float = 0.02
 
 
 def _unit_vec_from_elevation_deg(elev_deg: float) -> Vec3:
@@ -68,6 +73,21 @@ def _unit_vec_from_elevation_deg(elev_deg: float) -> Vec3:
   # +Z: вверх (высота)
   a = np.deg2rad(float(elev_deg))
   return np.array([np.cos(a), 0.0, np.sin(a)], dtype=np.float64)
+
+
+def _regime_coeff(mach: float, table: dict[str, float]) -> float:
+  if mach >= 1.2:
+    return float(table['supersonic'])
+  if mach <= 0.8:
+    return float(table['subsonic'])
+  return float(table['transonic'])
+
+
+def _interp_cmq(pairs: list[tuple[float, float]], mach: float) -> float:
+  ms = [p[0] for p in pairs]
+  cs = [p[1] for p in pairs]
+  m = float(np.clip(float(mach), ms[0], ms[-1]))
+  return float(np.interp(m, ms, cs))
 
 
 def _derivatives_external(
@@ -94,6 +114,7 @@ def _derivatives_external(
 
   a_lift = np.zeros(3, dtype=np.float64)
   a_magnus = np.zeros(3, dtype=np.float64)
+  moment = np.zeros(3, dtype=np.float64)
 
   rel_speed = float(np.linalg.norm(v_rel))
   if rel_speed > 0.0:
@@ -103,27 +124,67 @@ def _derivatives_external(
     axis_perp = axis - axis_dot * v_rel_hat
     axis_perp_norm = float(np.linalg.norm(axis_perp))
 
-    area_m2 = ctx.ammo.projectile.area_m2
-    mass_kg = ctx.ammo.projectile.mass_kg
+    if ctx.six_dof is not None:
+      mass_kg = ctx.six_dof.mass_kg
+      diameter_m = ctx.six_dof.diameter_m
+      area_m2 = float(np.pi * (0.5 * diameter_m) ** 2)
+    else:
+      mass_kg = ctx.ammo.projectile.mass_kg
+      diameter_m = ctx.ammo.projectile.diameter_m
+      area_m2 = ctx.ammo.projectile.area_m2
 
-    if ctx.lift_enabled and axis_perp_norm > 0.0:
+    if axis_perp_norm > 0.0:
       aoa = float(np.arctan2(axis_perp_norm, max(abs(axis_dot), 1e-9)))
-      cl = ctx.lift_cl_alpha * aoa
       lift_dir = axis_perp / axis_perp_norm
+    else:
+      aoa = 0.0
+      lift_dir = np.zeros(3, dtype=np.float64)
+
+    if ctx.six_dof is not None and axis_perp_norm > 0.0:
+      mach = rel_speed / max(ctx.medium.speed_of_sound_m_s, 1e-9)
+      cl_alpha = _regime_coeff(mach=mach, table=ctx.six_dof.cl_alpha)
+      cm_alpha = _regime_coeff(mach=mach, table=ctx.six_dof.cm_alpha)
+      cmq = _interp_cmq(ctx.six_dof.cmq_plus_cma, mach)
+
+      qbar = 0.5 * ctx.medium.density_kg_m3 * (rel_speed ** 2)
+      aoa_limit = float(max(ctx.six_dof_aoa_limit_rad, 1e-6))
+      aoa_clamped = float(np.clip(aoa, -aoa_limit, aoa_limit))
+      a_lift = -qbar * cl_alpha * aoa_clamped * area_m2 / max(mass_kg, 1e-9) * lift_dir
+      a_lift = a_lift * float(ctx.six_dof_force_scale)
+
+      # Restoring moment acts to reduce AoA; Cm_alpha treated as magnitude.
+      moment_alpha = -qbar * cm_alpha * aoa_clamped * area_m2 * diameter_m * lift_dir
+
+      omega = state.angvel_radps
+      omega_perp = omega - float(np.dot(omega, axis)) * axis
+      omega_perp_norm = float(np.linalg.norm(omega_perp))
+      moment_damp = np.zeros(3, dtype=np.float64)
+      if omega_perp_norm > 0.0:
+        spin_ratio = omega_perp_norm * diameter_m / max(2.0 * rel_speed, 1e-9)
+        spin_ratio = float(np.clip(spin_ratio, 0.0, 5.0))
+        moment_damp = -qbar * cmq * area_m2 * diameter_m * spin_ratio * (omega_perp / omega_perp_norm)
+
+      moment = moment_alpha + moment_damp
+      moment_norm = float(np.linalg.norm(moment))
+      if moment_norm > 1e3:
+        moment = moment * (1e3 / moment_norm)
+
+    elif ctx.lift_enabled and axis_perp_norm > 0.0:
+      cl = ctx.lift_cl_alpha * aoa
       a_lift = 0.5 * ctx.medium.density_kg_m3 * cl * area_m2 * (rel_speed ** 2) / max(mass_kg, 1e-9) * lift_dir
 
-    if ctx.magnus_enabled:
-      omega = state.angvel_radps
-      omega_mag = float(np.linalg.norm(omega))
-      if omega_mag > 0.0:
-        magnus_dir = np.cross(omega, v_rel)
-        magnus_norm = float(np.linalg.norm(magnus_dir))
-        if magnus_norm > 0.0:
-          magnus_dir = magnus_dir / magnus_norm
-          radius = 0.5 * ctx.ammo.projectile.diameter_m
-          spin_ratio = omega_mag * radius / max(rel_speed, 1e-9)
-          cl_magnus = ctx.magnus_cl_scale * spin_ratio
-          a_magnus = 0.5 * ctx.medium.density_kg_m3 * cl_magnus * area_m2 * (rel_speed ** 2) / max(mass_kg, 1e-9) * magnus_dir
+      if ctx.magnus_enabled:
+        omega = state.angvel_radps
+        omega_mag = float(np.linalg.norm(omega))
+        if omega_mag > 0.0:
+          magnus_dir = np.cross(omega, v_rel)
+          magnus_norm = float(np.linalg.norm(magnus_dir))
+          if magnus_norm > 0.0:
+            magnus_dir = magnus_dir / magnus_norm
+            radius = 0.5 * diameter_m
+            spin_ratio = omega_mag * radius / max(rel_speed, 1e-9)
+            cl_magnus = ctx.magnus_cl_scale * spin_ratio
+            a_magnus = 0.5 * ctx.medium.density_kg_m3 * cl_magnus * area_m2 * (rel_speed ** 2) / max(mass_kg, 1e-9) * magnus_dir
 
   dvel = a_grav + a_drag + a_lift + a_magnus
 
@@ -131,7 +192,16 @@ def _derivatives_external(
   omega = state.angvel_radps
   daxis = np.cross(omega, axis)
   droll = float(np.dot(omega, axis))
-  dangvel = np.zeros(3, dtype=np.float64)
+  if ctx.six_dof is None:
+    dangvel = np.zeros(3, dtype=np.float64)
+  else:
+    Ixx = ctx.six_dof.Ixx
+    Iyy = ctx.six_dof.Iyy
+    axis_dot_omega = float(np.dot(axis, omega))
+    I_omega = Iyy * omega + (Ixx - Iyy) * axis * axis_dot_omega
+    omega_cross_Iomega = np.cross(omega, I_omega)
+    I_inv = (1.0 / Iyy) * np.eye(3) + (1.0 / Ixx - 1.0 / Iyy) * np.outer(axis, axis)
+    dangvel = I_inv @ (moment - omega_cross_Iomega)
 
   return dpos, dvel, daxis, droll, dangvel
 
@@ -193,6 +263,10 @@ def _rk4_step(
   else:
     a1 = np.array([1.0, 0.0, 0.0], dtype=np.float64)
 
+  w_norm = float(np.linalg.norm(w1))
+  if w_norm > 2.0e5:
+    w1 = w1 * (2.0e5 / w_norm)
+
   return ProjectileState(
     t_s=t0 + dt,
     pos_m=p1,
@@ -251,6 +325,7 @@ def solve_scenario_external_ballistics_only(
   *,
   gravity_mps2: float,
   config: SolverConfig,
+  six_dof: Optional[ProjectileSixDof] = None,
 ) -> SolverResult:
   dt = float(config.dt_s)
   if dt <= 0.0:
@@ -277,6 +352,9 @@ def solve_scenario_external_ballistics_only(
     lift_cl_alpha=float(config.lift_cl_alpha),
     magnus_enabled=bool(config.magnus_enabled),
     magnus_cl_scale=float(config.magnus_cl_scale),
+    six_dof=six_dof if six_dof is not None else ammo.projectile.six_dof,
+    six_dof_force_scale=float(config.six_dof_force_scale),
+    six_dof_aoa_limit_rad=float(config.six_dof_aoa_limit_rad),
   )
 
   dir_vec = _unit_vec_from_elevation_deg(scenario.shot.elevation_angle_deg)

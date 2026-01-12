@@ -103,12 +103,82 @@ class ProjectileDrag:
 
 
 @dataclass(slots=True, frozen=True)
+class ProjectileSixDof:
+  mass_kg: float
+  diameter_m: float
+  Ixx: float
+  Iyy: float
+  cg_cal: float
+  cm_alpha: dict[str, float]
+  cl_alpha: dict[str, float]
+  cmq_plus_cma: list[tuple[float, float]]
+
+  @staticmethod
+  def from_dict(d: dict[str, Any]) -> "ProjectileSixDof":
+    mass_kg = _as_float(_req(d, 'mass'), name='projectile.six_dof.mass')
+    diameter_m = _as_float(_req(d, 'diameter'), name='projectile.six_dof.diameter')
+    Ixx = _as_float(_req(d, 'Ixx'), name='projectile.six_dof.Ixx')
+    Iyy = _as_float(_req(d, 'Iyy'), name='projectile.six_dof.Iyy')
+    cg_cal = _as_float(_req(d, 'CG_cal'), name='projectile.six_dof.CG_cal')
+
+    cm_alpha_in = _req(d, 'Cm_alpha')
+    cl_alpha_in = _req(d, 'Cl_alpha')
+    if not isinstance(cm_alpha_in, dict) or not isinstance(cl_alpha_in, dict):
+      raise TypeError('projectile.six_dof.Cm_alpha and Cl_alpha must be mappings')
+
+    def _req_regime(m: dict[str, Any], name: str) -> dict[str, float]:
+      out: dict[str, float] = {}
+      for key in ('supersonic', 'transonic', 'subsonic'):
+        if key not in m:
+          raise KeyError(f"Missing projectile.six_dof.{name}.{key}")
+        out[key] = _as_float(m[key], name=f"projectile.six_dof.{name}.{key}")
+      return out
+
+    cm_alpha = _req_regime(cm_alpha_in, 'Cm_alpha')
+    cl_alpha = _req_regime(cl_alpha_in, 'Cl_alpha')
+
+    cmq_in = _req(d, 'Cmq_plus_Cma')
+    if not isinstance(cmq_in, dict):
+      raise TypeError('projectile.six_dof.Cmq_plus_Cma must be mapping')
+    pairs: list[tuple[float, float]] = []
+    for k, v in cmq_in.items():
+      s = str(k).strip()
+      if s.lower().startswith('m'):
+        s = s[1:]
+      mach = _as_float(s, name='projectile.six_dof.Cmq_plus_Cma.mach')
+      val = _as_float(v, name='projectile.six_dof.Cmq_plus_Cma.value')
+      pairs.append((mach, val))
+    if len(pairs) < 2:
+      raise ValueError('projectile.six_dof.Cmq_plus_Cma must have at least 2 entries')
+    pairs.sort(key=lambda p: p[0])
+
+    if mass_kg <= 0.0:
+      raise ValueError(f"projectile.six_dof.mass must be > 0, got: {mass_kg}")
+    if diameter_m <= 0.0:
+      raise ValueError(f"projectile.six_dof.diameter must be > 0, got: {diameter_m}")
+    if Ixx <= 0.0 or Iyy <= 0.0:
+      raise ValueError("projectile.six_dof.Ixx and Iyy must be > 0")
+
+    return ProjectileSixDof(
+      mass_kg=mass_kg,
+      diameter_m=diameter_m,
+      Ixx=Ixx,
+      Iyy=Iyy,
+      cg_cal=cg_cal,
+      cm_alpha=cm_alpha,
+      cl_alpha=cl_alpha,
+      cmq_plus_cma=pairs,
+    )
+
+
+@dataclass(slots=True, frozen=True)
 class ProjectileSpec:
   mass_kg: float
   diameter_m: float
   length_m: float
   com_m: np.ndarray = field(repr=False)
   drag: Optional[ProjectileDrag] = None
+  six_dof: Optional[ProjectileSixDof] = None
 
   @staticmethod
   def from_dict(d: dict[str, Any]) -> "ProjectileSpec":
@@ -123,6 +193,8 @@ class ProjectileSpec:
 
     drag_in = d.get('drag', None)
     drag = ProjectileDrag.from_dict(drag_in) if isinstance(drag_in, dict) else None
+    six_dof_in = d.get('six_dof', None)
+    six_dof = ProjectileSixDof.from_dict(six_dof_in) if isinstance(six_dof_in, dict) else None
 
     mass_kg = mass_g / 1000.0
     diameter_m = diameter_mm / 1000.0
@@ -142,6 +214,7 @@ class ProjectileSpec:
       length_m=length_m,
       com_m=com_m,
       drag=drag,
+      six_dof=six_dof,
     )
 
   @property
